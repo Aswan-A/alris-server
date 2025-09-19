@@ -1,5 +1,5 @@
-import torch
-import open_clip
+import requests
+import base64
 import numpy as np
 from PIL import Image
 from io import BytesIO
@@ -7,22 +7,14 @@ import psycopg2
 from app.config.db import get_db_connection
 from app.config.settings import settings
 
-# Load model
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
-model_name = "ViT-B-32-quickgelu"
-pretrained = "laion400m_e32"
-model, _, preprocess = open_clip.create_model_and_transforms(
-    model_name=model_name,
-    pretrained=pretrained
-)
-tokenizer = open_clip.get_tokenizer(model_name)
-model = model.to(device).eval()
+JINA_API_URL = 'https://api.jina.ai/v1/classify'
+JINA_EMBEDDINGS_URL = 'https://api.jina.ai/v1/embeddings'
+JINA_API_KEY = settings.JINA_API_KEY
 
 # Define labels and departments
 labels = [
     "garbage dumping",
-    "open pothole",
+    "open pothole", 
     "damaged road",
     "abandoned vehicle",
     "illegal construction",
@@ -42,7 +34,7 @@ labels = [
 
 label_to_department = {
     "garbage dumping": "Municipal Waste Management",
-    "open pothole": "Public Works Department",
+    "open pothole": "Public Works Department", 
     "damaged road": "Road Maintenance",
     "abandoned vehicle": "Traffic Police",
     "illegal construction": "Town Planning",
@@ -60,48 +52,121 @@ label_to_department = {
     "blocked drainage": "Drainage Board"
 }
 
-text_tokens = tokenizer(labels).to(device)
+def image_bytes_to_base64(image_bytes: bytes) -> str:
+    """Convert image bytes to base64 string"""
+    return base64.b64encode(image_bytes).decode('utf-8')
 
 def classify_clip(image_bytes: bytes):
-    """Classify an image using CLIP model"""
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
-    image_tensor = preprocess(image).unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        image_features = model.encode_image(image_tensor)
-        text_features = model.encode_text(text_tokens)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
-        text_features /= text_features.norm(dim=-1, keepdim=True)
-        logits_per_image = (image_features @ text_features.T) * 100.0
-        probs = logits_per_image.softmax(dim=-1).cpu().numpy()[0]
-    
-    best_idx = probs.argmax()
-    best_label = labels[best_idx]
-    responsible_authority = label_to_department.get(best_label, "General Department")
-    
-    return {
-        "label": best_label,
-        "confidence": float(probs[best_idx]),
-        "probabilities": {label: float(prob) for label, prob in zip(labels, probs)},
-        "department": responsible_authority
-    }
+    """Classify an image using Jina CLIP v2 API"""
+    try:
+        # Convert image to base64
+        image_b64 = image_bytes_to_base64(image_bytes)
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {JINA_API_KEY}'
+        }
+        
+        data = {
+            "model": "jina-clip-v2",
+            "input": [
+                {"image": image_b64}
+            ],
+            "labels": labels
+        }
+        
+        response = requests.post(JINA_API_URL, headers=headers, json=data)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # Extract classification results
+        classification_data = result['data'][0]
+        predictions = classification_data['predictions']
+        
+        # Find best prediction
+        best_prediction = max(predictions, key=lambda x: x['score'])
+        best_label = best_prediction['label']
+        best_confidence = best_prediction['score']
+        
+        # Create probabilities dict
+        probabilities = {pred['label']: pred['score'] for pred in predictions}
+        
+        responsible_authority = label_to_department.get(best_label, "General Department")
+        
+        return {
+            "label": best_label,
+            "confidence": float(best_confidence),
+            "probabilities": probabilities,
+            "department": responsible_authority
+        }
+        
+    except requests.exceptions.RequestException as e:
+        print(f"API request error: {e}")
+        return {
+            "error": f"API request failed: {str(e)}",
+            "label": None,
+            "confidence": 0.0,
+            "probabilities": {},
+            "department": "General Department"
+        }
+    except Exception as e:
+        print(f"Classification error: {e}")
+        return {
+            "error": f"Classification failed: {str(e)}",
+            "label": None,
+            "confidence": 0.0,
+            "probabilities": {},
+            "department": "General Department"
+        }
 
 def extract_clip_embedding(image_bytes: bytes) -> list:
-    """Extract CLIP embedding from image"""
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
-    image_tensor = preprocess(image).unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        embedding = model.encode_image(image_tensor)
-        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-    
-    embedding_list = embedding.squeeze(0).cpu().tolist()
-    return embedding_list
+    """Extract CLIP embedding from image using Jina API"""
+    try:
+        # Convert image to base64
+        image_b64 = image_bytes_to_base64(image_bytes)
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {JINA_API_KEY}'
+        }
+        
+        data = {
+            "model": "jina-clip-v2",
+            "input": [
+                {"image": image_b64}
+            ]
+        }
+        
+        response = requests.post(JINA_EMBEDDINGS_URL, headers=headers, json=data)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # Extract embedding
+        embedding = result['data'][0]['embedding']
+        return embedding
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Embedding API request error: {e}")
+        return None
+    except Exception as e:
+        print(f"Embedding extraction error: {e}")
+        return None
 
 def merge_model(image_bytes: bytes, latitude: float, longitude: float):
     """Check for duplicate issues using CLIP embeddings"""
     print(f"\n🔍 Checking location: ({latitude}, {longitude})")
     embedding = extract_clip_embedding(image_bytes)
+    
+    if embedding is None:
+        print("❌ Failed to extract embedding")
+        return {
+            "error": "Failed to extract embedding",
+            "embedding": None,
+            "issue_id": None,
+            "is_duplicate": False
+        }
     
     conn = get_db_connection()
     try:
