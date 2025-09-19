@@ -6,29 +6,33 @@ from app.utils.jwt import get_password_hash
 from app.middleware.auth import get_current_user
 
 router = APIRouter()
+from pydantic import BaseModel
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    phone: str | None = None
 
 @router.post("/register")
-async def register_user(name: str, email: str, password: str, phone: str = None, db: Session = Depends(get_db)):
-    # Check if user already exists
-    db_user = db.query(User).filter(User.email == email).first()
+async def register_user(request: RegisterRequest, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == request.email).first()
     if db_user:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=400,
             detail="Email already registered"
         )
-    
-    # Create new user
-    hashed_password = get_password_hash(password)
+    hashed_password = get_password_hash(request.password)
     db_user = User(
-        name=name,
-        email=email,
-        phone=phone,
+        name=request.name,
+        email=request.email,
+        phone=request.phone,
         password_hash=hashed_password
     )
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
-    
+
     return {"message": "User registered successfully", "user_id": str(db_user.id)}
 
 @router.get("/me")
