@@ -4,7 +4,7 @@ from app.database.migrations import run_migrations
 from app.controllers import auth, users, issues, reports
 
 # Run migrations on startup
-run_migrations()
+#run_migrations()
 
 app = FastAPI(title="Citizen Issue Reporting System")
 
